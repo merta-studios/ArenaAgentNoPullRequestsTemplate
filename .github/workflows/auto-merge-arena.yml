@@ -1,0 +1,153 @@
+# =============================================================================
+#  Auto-Merge: KI-Agenten-Branches  →  main
+# =============================================================================
+#
+#  Pfad im Repository:  .github/workflows/auto-merge-arena.yml
+#
+#  ZWECK
+#  -----
+#  KI-Coding-Agenten (z. B. Arena Agent Mode) dürfen nur auf eigene Branches
+#  pushen (Muster: arena/<id>-<repo>). Dieser Workflow sorgt dafür, dass JEDER
+#  Push auf einen solchen Branch innerhalb von ca. einer Minute automatisch in
+#  `main` landet – ohne Pull Request, ohne Review, ohne Klick.
+#
+#  ABLAUF
+#  ------
+#  Agent pusht auf arena/…  →  Workflow startet  →  main wird ausgecheckt
+#  →  Branch wird in main gemerged (Fast-Forward, wenn möglich)
+#  →  main wird gepusht  →  Deploy-Webhooks (Render, Fly, …) feuern wie gewohnt.
+#
+#  Zusätzlich lässt sich der Workflow manuell starten
+#  (Actions-Tab → "Auto-Merge → main" → "Run workflow"), um einen beliebigen
+#  Branch nach main zu holen – z. B. liegengebliebene Branches alter Sessions.
+#
+#  SICHERHEITSHINWEIS
+#  ------------------
+#  Es gibt kein Review mehr. Was auf einem arena/-Branch landet, ist kurz darauf
+#  in main und ggf. live. Fehler korrigiert man per weiterem Push oder per
+#  "Revert" auf GitHub. Bei Merge-Konflikten schlägt der Lauf fehl, es wird
+#  NICHTS gepusht, und GitHub schickt eine Benachrichtigung.
+#
+#  EINRICHTUNG
+#  -----------
+#  1. Diese Datei unter exakt obigem Pfad auf `main` ablegen. Web-UI genügt:
+#     "Add file → Create new file", Pfad eintippen, Inhalt einfügen, committen.
+#     Funktioniert auch als allererster Commit in einem leeren Repository.
+#  2. Fertig. `permissions: contents: write` (unten) reicht dem Standard-Token.
+#     Falls ein Lauf trotzdem mit "403" / "Permission denied" scheitert:
+#     Settings → Actions → General → Workflow permissions
+#     → "Read and write permissions" auswählen.
+#  3. Optional – nur nötig, wenn weitere Workflows (z. B. CI) auf main
+#     automatisch laufen sollen: Fine-grained PAT mit "Contents: Read and write"
+#     für dieses Repo erstellen und als Secret AUTOMERGE_TOKEN hinterlegen.
+#     Der Workflow benutzt ihn dann von selbst (siehe `token:` unten).
+#     Hintergrund: Pushes mit dem Standard-GITHUB_TOKEN lösen aus Schleifen-
+#     schutz keine weiteren Actions-Workflows aus. Externe Deploy-Webhooks
+#     sind davon NICHT betroffen.
+#
+# =============================================================================
+
+name: Auto-Merge → main
+
+on:
+  push:
+    branches:
+      # Branch-Muster, die automatisch nach main gemerged werden.
+      # Weitere Agenten/Tools einfach ergänzen, z. B. 'codex/**', 'copilot/**'.
+      - 'arena/**'
+
+  # Manueller Start für beliebige Branches (Actions-Tab → "Run workflow").
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch, der nach main gemerged werden soll'
+        required: true
+        type: string
+
+# Minimalprinzip: Der Workflow braucht nur Schreibrecht auf den Repo-Inhalt.
+permissions:
+  contents: write
+
+# Pro Branch läuft höchstens ein Merge gleichzeitig; ein laufender Merge wird
+# nie abgebrochen. Wettläufe zwischen verschiedenen Branches fängt die
+# Wiederholungsschleife im Skript ab.
+concurrency:
+  group: auto-merge-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Branch nach main mergen
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: main auschecken
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0   # komplette Historie – für den Merge erforderlich
+          # Nutzt AUTOMERGE_TOKEN, falls als Secret vorhanden, sonst den
+          # Standard-Token des Workflows (läuft ohne weitere Einrichtung).
+          token: ${{ secrets.AUTOMERGE_TOKEN || github.token }}
+
+      - name: Quell-Branch mergen und main pushen
+        env:
+          # Branch-Name bewusst über env statt direkt im Skript, damit
+          # Sonderzeichen im Namen keine Shell-Injektion ermöglichen.
+          SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # --- Quell-Branch holen -------------------------------------------
+          if ! git fetch --no-tags origin "refs/heads/${SOURCE_BRANCH}"; then
+            echo "::error::Branch '${SOURCE_BRANCH}' existiert nicht (mehr)."
+            exit 1
+          fi
+          SOURCE_SHA="$(git rev-parse FETCH_HEAD)"
+
+          # --- Merge + Push; bei Wettlauf mit anderen Pushes bis zu 5 Versuche
+          for attempt in 1 2 3 4 5; do
+            git fetch --no-tags origin main
+            git reset -q --hard origin/main
+            BEFORE_SHA="$(git rev-parse HEAD)"
+
+            # Schon enthalten (erneuter Lauf, leerer Branch)? Dann fertig.
+            if git merge-base --is-ancestor "${SOURCE_SHA}" HEAD; then
+              echo "::notice::main enthält ${SOURCE_BRANCH}@${SOURCE_SHA:0:7} bereits – nichts zu tun."
+              exit 0
+            fi
+
+            # Fast-Forward, wenn möglich, sonst Merge-Commit. Wer IMMER einen
+            # Merge-Commit möchte (sichtbare Session-Grenzen): '--no-ff' ergänzen.
+            if ! git merge -m "Auto-Merge: ${SOURCE_BRANCH} → main" "${SOURCE_SHA}"; then
+              git merge --abort || true
+              echo "::error::Merge-Konflikt zwischen '${SOURCE_BRANCH}' und main – es wurde nichts gepusht. Lösung: im Agent-Branch 'git merge origin/main' ausführen, Konflikte lösen, erneut pushen."
+              exit 1
+            fi
+
+            if git push origin HEAD:main; then
+              COUNT="$(git rev-list --count "${BEFORE_SHA}..HEAD")"
+              echo "::notice::${SOURCE_BRANCH}@${SOURCE_SHA:0:7} ist jetzt in main (${COUNT} Commit(s))."
+              {
+                echo "### ✅ Auto-Merge nach main"
+                echo
+                echo "| | |"
+                echo "|---|---|"
+                echo "| Quelle | \`${SOURCE_BRANCH}\` @ \`${SOURCE_SHA:0:7}\` |"
+                echo "| main vorher | \`${BEFORE_SHA:0:7}\` |"
+                echo "| main jetzt | \`$(git rev-parse --short HEAD)\` |"
+                echo "| Commits | ${COUNT} |"
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+
+            echo "Push abgelehnt – main hat sich parallel geändert. Neuer Versuch ${attempt}/5 …"
+            sleep $(( attempt * 3 ))
+          done
+
+          echo "::error::main konnte nach 5 Versuchen nicht aktualisiert werden."
+          exit 1
